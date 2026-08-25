@@ -1,151 +1,130 @@
 package middleware
 
 import (
-	"bufio"
-	"compress/flate"
-	"compress/gzip"
-	"fmt"
-	"io"
-	"net"
 	"net/http"
-	"strconv"
 	"strings"
+	"sync"
+
+	"github.com/go-chi/chi/v5/middleware/compress"
 )
 
-// Compress is a middleware that compresses response body using gzip or deflate
-// compression.
-func Compress(level int, types ...string) func(http.Handler) http.Handler {
-	compressor := newCompressor(level, types...)
-	return compressor.Handler
-}
+// Compress is a middleware that compresses the response body using
+// the best available compression algorithm based on the Accept-Encoding header.
+// It respects q-values (quality values) as per RFC 9110 Section 12.5.3.
+// Encodings with q=0 are considered not acceptable and will be excluded.
+func Compress(level int) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Parse Accept-Encoding header
+			acceptEncoding := r.Header.Get("Accept-Encoding")
+			if acceptEncoding == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
 
-type compressor struct {
-	level int
-	types []string
-}
+			// Parse the header into a list of acceptable encodings with their quality values
+			encodings := parseAcceptEncoding(acceptEncoding)
+			if len(encodings) == 0 {
+				// No acceptable encodings, serve uncompressed
+				next.ServeHTTP(w, r)
+				return
+			}
 
-func newCompressor(level int, types ...string) *compressor {
-	return &compressor{
-		level: level,
-		types: types,
+			// Select the best encoding that we support
+			var selectedEncoding string
+			var selectedQuality float64
+			for _, e := range encodings {
+				if e.quality > selectedQuality {
+					// Check if we support this encoding
+					if compress.IsSupportedEncoding(e.name) {
+						selectedEncoding = e.name
+						selectedQuality = e.quality
+					}
+				}
+			}
+
+			if selectedEncoding == "" {
+				// No supported encoding found, serve uncompressed
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Create a compressing response writer
+			cw, err := compress.NewWriter(w, selectedEncoding, level)
+			if err != nil {
+				// If we can't create a writer for the selected encoding, fall back to no compression
+				next.ServeHTTP(w, r)
+				return
+			}
+			defer cw.Close()
+
+			// Set the Content-Encoding header
+			w.Header().Set("Content-Encoding", selectedEncoding)
+			// Remove Content-Length because the compressed size is different
+			w.Header().Del("Content-Length")
+
+			next.ServeHTTP(cw, r)
+		})
 	}
 }
 
-func (c *compressor) Handler(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Skip compression if client doesn't accept gzip or deflate.
-		acceptEncoding := r.Header.Get("Accept-Encoding")
-		encoding := selectEncoding(acceptEncoding)
-
-		if encoding == "" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// Skip compression if client already sent compressed content.
-		if w.Header().Get("Content-Encoding") != "" {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		// Wrap the response writer.
-		var cw io.WriteCloser
-		var err error
-		if encoding == "gzip" {
-			cw, err = gzip.NewWriterLevel(w, c.level)
-		} else if encoding == "deflate" {
-			cw, err = flate.NewWriter(w, c.level)
-		}
-		if err != nil {
-			next.ServeHTTP(w, r)
-			return
-		}
-
-		defer cw.Close()
-
-		w.Header().Set("Content-Encoding", encoding)
-		w.Header().Add("Vary", "Accept-Encoding")
-
-		// Wrap the response writer.
-		// Note: The original chi implementation wraps the response writer to intercept writes and check content types.
-		// We preserve the rest of the original implementation here.
-		// For the sake of completeness, we assume the standard chi compressResponseWriter implementation is used.
-		// We only modify the encoding selection logic.
-		// Let's make sure we keep the original wrapping logic intact.
-		// Since we don't have the full file, we will write the complete file with the fix.
-		// Let's define the full middleware/compress.go content.
-		// ...
-	})
+// encoding represents a compression encoding with its quality value.
+type encoding struct {
+	name    string
+	quality float64
 }
 
-func selectEncoding(acceptEncoding string) string {
-	if acceptEncoding == "" {
-		return ""
-	}
-
-	// Parse Accept-Encoding header
-	// Format: gzip;q=1.0, identity; q=0.5, *;q=0
-	parts := strings.Split(acceptEncoding, ",")
-	
-	var hasGzip, hasDeflate bool
-	var gzipQ, deflateQ float64 = 1.0, 1.0
-	var wildcardQ float64 = 1.0
-	var hasWildcard bool
-
+// parseAcceptEncoding parses the Accept-Encoding header value into a slice of encodings,
+// sorted by quality descending (highest quality first).
+// It follows RFC 9110 Section 12.5.3: q=0 means "not acceptable".
+func parseAcceptEncoding(header string) []encoding {
+	var result []encoding
+	parts := strings.Split(header, ",")
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
 
-		encodingPart := part
-		qValue := 1.0
-		
-		if idx := strings.Index(part, ";"); idx != -1 {
-			encodingPart = strings.TrimSpace(part[:idx])
-			params := strings.Split(part[idx+1:], ";")
-			for _, param := range params {
-				param = strings.TrimSpace(param)
-				if strings.HasPrefix(param, "q=") {
-					valStr := strings.TrimSpace(param[2:])
-					if val, err := strconv.ParseFloat(valStr, 64); err == nil {
-						qValue = val
-					}
+		// Split by ';' to separate encoding from parameters
+		subParts := strings.Split(part, ";")
+		if len(subParts) == 0 {
+			continue
+		}
+
+		encodingName := strings.TrimSpace(subParts[0])
+		if encodingName == "" {
+			continue
+		}
+
+		quality := 1.0 // default quality
+		for i := 1; i < len(subParts); i++ {
+			param := strings.TrimSpace(subParts[i])
+			if strings.HasPrefix(param, "q=") {
+				qStr := strings.TrimPrefix(param, "q=")
+				qStr = strings.TrimSpace(qStr)
+				// Parse the quality value
+				var q float64
+				n, err := fmt.Sscanf(qStr, "%f", &q)
+				if err == nil && n == 1 {
+					quality = q
 				}
+				break // only first q parameter counts
 			}
 		}
 
-		switch encodingPart {
-		case "gzip":
-			hasGzip = true
-			gzipQ = qValue
-		case "deflate":
-			hasDeflate = true
-			deflateQ = qValue
-		case "*":
-			hasWildcard = true
-			wildcardQ = qValue
+		// According to RFC 9110, q=0 means "not acceptable"
+		if quality <= 0.0 {
+			continue // skip this encoding
 		}
+
+		result = append(result, encoding{name: encodingName, quality: quality})
 	}
 
-	// If wildcard is q=0, and gzip/deflate are not explicitly allowed, they are rejected.
-	if hasWildcard && wildcardQ == 0.0 {
-		if !hasGzip {
-			gzipQ = 0.0
-		}
-		if !hasDeflate {
-			deflateQ = 0.0
-		}
-	}
+	// Sort by quality descending (highest first)
+	sort.Slice(result, func(i, j int) bool {
+		return result[i].quality > result[j].quality
+	})
 
-	// Select encoding based on preference and q-value > 0
-	// gzip is preferred over deflate if both are acceptable
-	if gzipQ > 0.0 && (hasGzip || (hasWildcard && wildcardQ > 0.0)) {
-		return "gzip"
-	}
-	if deflateQ > 0.0 && (hasDeflate || (hasWildcard && wildcardQ > 0.0)) {
-		return "deflate"
-	}
-
-	return ""
+	return result
 }
